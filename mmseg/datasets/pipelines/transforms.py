@@ -1,12 +1,21 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import copy
+import inspect
 
+import cv2
 import mmcv
 import numpy as np
 from mmcv.utils import deprecated_api_warning, is_tuple_of
 from numpy import random
 
 from ..builder import PIPELINES
+
+try:
+    import albumentations
+    from albumentations import Compose
+except ImportError:
+    albumentations = None
+    Compose = None
 
 
 @PIPELINES.register_module()
@@ -99,13 +108,19 @@ class Resize(object):
             Default: None
         keep_ratio (bool): Whether to keep the aspect ratio when resizing the
             image. Default: True
+        min_size (int, optional): The minimum size for input and the shape
+            of the image and seg map will not be less than ``min_size``.
+            As the shape of model input is fixed like 'SETR' and 'BEiT'.
+            Following the setting in these models, resized images must be
+            bigger than the crop size in ``slide_inference``. Default: None
     """
 
     def __init__(self,
                  img_scale=None,
                  multiscale_mode='range',
                  ratio_range=None,
-                 keep_ratio=True):
+                 keep_ratio=True,
+                 min_size=None):
         if img_scale is None:
             self.img_scale = None
         else:
@@ -126,6 +141,7 @@ class Resize(object):
         self.multiscale_mode = multiscale_mode
         self.ratio_range = ratio_range
         self.keep_ratio = keep_ratio
+        self.min_size = min_size
 
     @staticmethod
     def random_select(img_scales):
@@ -240,6 +256,23 @@ class Resize(object):
     def _resize_img(self, results):
         """Resize images with ``results['scale']``."""
         if self.keep_ratio:
+            if self.min_size is not None:
+                # TODO: Now 'min_size' is an 'int' which means the minimum
+                # shape of images is (min_size, min_size, 3). 'min_size'
+                # with tuple type will be supported, i.e. the width and
+                # height are not equal.
+                if min(results['scale']) < self.min_size:
+                    new_short = self.min_size
+                else:
+                    new_short = min(results['scale'])
+
+                h, w = results['img'].shape[:2]
+                if h > w:
+                    new_h, new_w = new_short * h / w, new_short
+                else:
+                    new_h, new_w = new_short, new_short * w / h
+                results['scale'] = (new_h, new_w)
+
             img, scale_factor = mmcv.imrescale(
                 results['img'], results['scale'], return_scale=True)
             # the w_scale and h_scale has minor difference
@@ -1308,4 +1341,147 @@ class RandomMosaic(object):
         repr_str += f'center_ratio_range={self.center_ratio_range}, '
         repr_str += f'pad_val={self.pad_val}, '
         repr_str += f'seg_pad_val={self.pad_val})'
+        return repr_str
+
+
+@PIPELINES.register_module()
+class Albu:
+    """Albumentation augmentation. Adds custom transformations from
+    Albumentations library. Please, visit
+    `https://albumentations.readthedocs.io` to get more information. An example
+    of ``transforms`` is as followed:
+
+    .. code-block::
+        [
+            dict(
+                type='ShiftScaleRotate',
+                shift_limit=0.0625,
+                scale_limit=0.0,
+                rotate_limit=0,
+                interpolation=1,
+                p=0.5),
+            dict(
+                type='RandomBrightnessContrast',
+                brightness_limit=[0.1, 0.3],
+                contrast_limit=[0.1, 0.3],
+                p=0.2),
+            dict(type='ChannelShuffle', p=0.1),
+            dict(
+                type='OneOf',
+                transforms=[
+                    dict(type='Blur', blur_limit=3, p=1.0),
+                    dict(type='MedianBlur', blur_limit=3, p=1.0)
+                ],
+                p=0.1),
+        ]
+    Args:
+        transforms (list[dict]): A list of albu transformations
+        keymap (dict): Contains {'input key':'albumentation-style key'}
+        update_pad_shape (bool): Whether to update padding shape according to \
+            the output shape of the last transform
+    """
+
+    def __init__(self, transforms, keymap=None, update_pad_shape=False):
+        if Compose is None:
+            raise ImportError(
+                'albumentations is not installed, '
+                'we suggest install albumentation by '
+                '"pip install albumentations>=0.3.2 --no-binary qudida,albumentations"'  # noqa
+            )
+
+        # Args will be modified later, copying it will be safer
+        transforms = copy.deepcopy(transforms)
+
+        self.transforms = transforms
+        self.filter_lost_elements = False
+        self.update_pad_shape = update_pad_shape
+
+        self.aug = Compose([self.albu_builder(t) for t in self.transforms])
+
+        if not keymap:
+            self.keymap_to_albu = {
+                'img': 'image',
+                'gt_masks': 'masks',
+            }
+        else:
+            self.keymap_to_albu = copy.deepcopy(keymap)
+        self.keymap_back = {v: k for k, v in self.keymap_to_albu.items()}
+
+    def albu_builder(self, cfg):
+        """Import a module from albumentations.
+
+        It inherits some of :func:`build_from_cfg` logic.
+        Args:
+            cfg (dict): Config dict. It should at least contain the key "type".
+        Returns:
+            obj: The constructed object.
+        """
+
+        assert isinstance(cfg, dict) and 'type' in cfg
+        args = cfg.copy()
+
+        obj_type = args.pop('type')
+        if mmcv.is_str(obj_type):
+            if albumentations is None:
+                raise ImportError(
+                    'albumentations is not installed, '
+                    'we suggest install albumentation by '
+                    '"pip install albumentations>=0.3.2 --no-binary qudida,albumentations"'  # noqa
+                )
+            obj_cls = getattr(albumentations, obj_type)
+        elif inspect.isclass(obj_type):
+            obj_cls = obj_type
+        else:
+            raise TypeError(
+                f'type must be a str or valid type, but got {type(obj_type)}')
+
+        if 'transforms' in args:
+            args['transforms'] = [
+                self.albu_builder(transform)
+                for transform in args['transforms']
+            ]
+
+        return obj_cls(**args)
+
+    @staticmethod
+    def mapper(d, keymap):
+        """Dictionary mapper.
+
+        Renames keys according to keymap provided.
+        Args:
+            d (dict): old dict
+            keymap (dict): {'old_key':'new_key'}
+        Returns:
+            dict: new dict.
+        """
+
+        updated_dict = {}
+        for k, _ in zip(d.keys(), d.values()):
+            new_k = keymap.get(k, k)
+            updated_dict[new_k] = d[k]
+        return updated_dict
+
+    def __call__(self, results):
+        # dict to albumentations format
+        results = self.mapper(results, self.keymap_to_albu)
+
+        # Convert to RGB since Albumentations works with RGB images
+        results['image'] = cv2.cvtColor(results['image'], cv2.COLOR_BGR2RGB)
+
+        results = self.aug(**results)
+
+        # Convert back to BGR
+        results['image'] = cv2.cvtColor(results['image'], cv2.COLOR_RGB2BGR)
+
+        # back to the original format
+        results = self.mapper(results, self.keymap_back)
+
+        # update final shape
+        if self.update_pad_shape:
+            results['pad_shape'] = results['img'].shape
+
+        return results
+
+    def __repr__(self):
+        repr_str = self.__class__.__name__ + f'(transforms={self.transforms})'
         return repr_str

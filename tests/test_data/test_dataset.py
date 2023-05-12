@@ -16,7 +16,7 @@ from mmseg.datasets import (DATASETS, ADE20KDataset, CityscapesDataset,
                             COCOStuffDataset, ConcatDataset, CustomDataset,
                             ISPRSDataset, LoveDADataset, MultiImageMixDataset,
                             PascalVOCDataset, PotsdamDataset, RepeatDataset,
-                            build_dataset)
+                            build_dataset, iSAIDDataset)
 
 
 def test_classes():
@@ -25,10 +25,11 @@ def test_classes():
         'pascal_voc')
     assert list(
         ADE20KDataset.CLASSES) == get_classes('ade') == get_classes('ade20k')
+    assert list(COCOStuffDataset.CLASSES) == get_classes('cocostuff')
     assert list(LoveDADataset.CLASSES) == get_classes('loveda')
     assert list(PotsdamDataset.CLASSES) == get_classes('potsdam')
     assert list(ISPRSDataset.CLASSES) == get_classes('vaihingen')
-    assert list(COCOStuffDataset.CLASSES) == get_classes('cocostuff')
+    assert list(iSAIDDataset.CLASSES) == get_classes('isaid')
 
     with pytest.raises(ValueError):
         get_classes('unsupported')
@@ -73,6 +74,7 @@ def test_palette():
     assert LoveDADataset.PALETTE == get_palette('loveda')
     assert PotsdamDataset.PALETTE == get_palette('potsdam')
     assert COCOStuffDataset.PALETTE == get_palette('cocostuff')
+    assert iSAIDDataset.PALETTE == get_palette('isaid')
 
     with pytest.raises(ValueError):
         get_palette('unsupported')
@@ -361,6 +363,69 @@ def test_custom_dataset():
     assert not np.isnan(eval_results['mFscore'])
     assert not np.isnan(eval_results['mPrecision'])
     assert not np.isnan(eval_results['mRecall'])
+
+
+def test_custom_dataset_pre_eval():
+    """Test pre-eval function of custom dataset with reduce zero label and
+    removed classes.
+
+    The GT segmentation contain 4 classes: "A", "B", "C", "D", as well as
+    a zero label. Therefore, the labels go from 0 to 4.
+
+    Then, we will remove class "C" while instantiating the dataset. Therefore,
+    pre-eval must reduce the zero label and also apply label_map in the correct
+    order.
+    """
+
+    # create a dummy dataset on disk
+    img = np.random.rand(10, 10)
+    ann = np.zeros_like(img)
+    ann[2:4, 2:4] = 1
+    ann[2:4, 6:8] = 2
+    ann[6:8, 2:4] = 3
+    ann[6:8, 6:8] = 4
+
+    tmp_dir = tempfile.TemporaryDirectory()
+    img_path = osp.join(tmp_dir.name, 'img', '00000.jpg')
+    ann_path = osp.join(tmp_dir.name, 'ann', '00000.png')
+
+    import mmcv
+    mmcv.imwrite(img, img_path)
+    mmcv.imwrite(ann, ann_path)
+
+    class FourClassDatasetWithZeroLabel(CustomDataset):
+        CLASSES = ['A', 'B', 'C', 'D']  # 4 classes
+        PALETTE = [(0, 0, 0)] * 4  # dummy palette
+
+    # with img_dir, ann_dir, split
+    dataset = FourClassDatasetWithZeroLabel(
+        [],
+        classes=['A', 'B', 'D'],  # original classes with class "C" removed
+        reduce_zero_label=True,  # reduce zero label set to True
+        data_root=osp.join(osp.dirname(__file__), tmp_dir.name),
+        img_dir='img/',
+        ann_dir='ann/',
+        img_suffix='.jpg',
+        seg_map_suffix='.png')
+    assert len(dataset) == 1
+
+    # there are three classes ("A", "B", "D") that the network predicts
+    perfect_pred = np.zeros([10, 10], dtype=np.int64)
+    perfect_pred[2:4, 2:4] = 0  # 'A': 1 reduced to 0 that maps to 0
+    perfect_pred[2:4, 6:8] = 1  # 'B': 2 reduced to 1 that maps to 1
+    perfect_pred[6:8, 2:4] = 0  # 'C': 3 reduced to 2 that maps to -1, ignored
+    perfect_pred[6:8, 6:8] = 2  # 'D': 4 reduced to 3 that maps to 2
+
+    results = dataset.pre_eval([perfect_pred], [0])
+    from mmseg.core.evaluation.metrics import pre_eval_to_metrics
+    eval_results = pre_eval_to_metrics(results, ['mIoU', 'mDice', 'mFscore'])
+
+    # the results should be perfect
+    for metric in 'IoU', 'aAcc', 'Acc', 'Dice', 'Fscore', 'Precision', \
+                  'Recall':
+        assert (eval_results[metric] == 1.0).all()
+
+    tmp_dir.cleanup()
 
 
 @pytest.mark.parametrize('separate_eval', [True, False])
@@ -728,6 +793,27 @@ def test_vaihingen():
         ann_dir=osp.join(
             osp.dirname(__file__), '../data/pseudo_vaihingen_dataset/ann_dir'))
     assert len(test_dataset) == 1
+
+
+def test_isaid():
+    test_dataset = iSAIDDataset(
+        pipeline=[],
+        img_dir=osp.join(
+            osp.dirname(__file__), '../data/pseudo_isaid_dataset/img_dir'),
+        ann_dir=osp.join(
+            osp.dirname(__file__), '../data/pseudo_isaid_dataset/ann_dir'))
+    assert len(test_dataset) == 2
+    isaid_info = test_dataset.load_annotations(
+        img_dir=osp.join(
+            osp.dirname(__file__), '../data/pseudo_isaid_dataset/img_dir'),
+        img_suffix='.png',
+        ann_dir=osp.join(
+            osp.dirname(__file__), '../data/pseudo_isaid_dataset/ann_dir'),
+        seg_map_suffix='.png',
+        split=osp.join(
+            osp.dirname(__file__),
+            '../data/pseudo_isaid_dataset/splits/train.txt'))
+    assert len(isaid_info) == 1
 
 
 @patch('mmseg.datasets.CustomDataset.load_annotations', MagicMock)

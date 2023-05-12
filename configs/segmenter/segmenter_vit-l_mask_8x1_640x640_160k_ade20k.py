@@ -1,11 +1,12 @@
 _base_ = [
     '../_base_/models/segmenter_vit-b16_mask.py',
-    '../_base_/datasets/ade20k.py', '../_base_/default_runtime.py',
+    '../_base_/datasets/ade20k_640x640.py', '../_base_/default_runtime.py',
     '../_base_/schedules/schedule_160k.py'
 ]
+checkpoint = 'https://download.openmmlab.com/mmsegmentation/v0.5/pretrain/segmenter/vit_large_p16_384_20220308-d4efb41d.pth'  # noqa
 
 model = dict(
-    pretrained='pretrain/vit_large_p16_384.pth',
+    pretrained=checkpoint,
     backbone=dict(
         type='VisionTransformer',
         img_size=(640, 640),
@@ -28,7 +29,7 @@ crop_size = (640, 640)
 train_pipeline = [
     dict(type='LoadImageFromFile'),
     dict(type='LoadAnnotations', reduce_zero_label=True),
-    dict(type='Resize', img_scale=(2048, 640), ratio_range=(0.5, 2.0)),
+    dict(type='Resize', img_scale=(2560, 640), ratio_range=(0.5, 2.0)),
     dict(type='RandomCrop', crop_size=crop_size, cat_max_ratio=0.75),
     dict(type='RandomFlip', prob=0.5),
     dict(type='PhotoMetricDistortion'),
@@ -41,7 +42,7 @@ test_pipeline = [
     dict(type='LoadImageFromFile'),
     dict(
         type='MultiScaleFlipAug',
-        img_scale=(2048, 640),
+        img_scale=(2560, 640),
         # img_ratios=[0.5, 0.75, 1.0, 1.25, 1.5, 1.75],
         flip=False,
         transforms=[
